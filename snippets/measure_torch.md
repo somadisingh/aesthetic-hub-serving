@@ -3,10 +3,15 @@
 
 ## Measure inference performance of PyTorch model on CPU 
 
-First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. After completing this section, you should understand:
+First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. Our full inference pipeline has two stages:
 
-* how to measure the inference latency of a PyTorch model
-* how to measure the throughput of batch inference of a PyTorch model
+1. **CLIP ViT-L/14** (image encoder): Takes a raw image and produces a 768-dimensional embedding vector
+2. **Aesthetic MLP head**: Takes the 768-dim embedding and produces an aesthetic quality score (0-10)
+
+We will benchmark each stage independently, then measure the end-to-end pipeline. After completing this section, you should understand:
+
+* how to measure the inference latency and throughput of a PyTorch model
+* the relative cost of the image encoder (ViT) vs the downstream head (MLP)
 * how to compare eager model execution vs a compiled model
 
 You will execute this notebook *in a Jupyter container running on a compute instance*, not on the general-purpose Chameleon Jupyter environment from which you provision resources.
@@ -69,28 +74,217 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers
 
 ::: {.cell .markdown}
 
-We will measure:
+---
 
-* the size of the model on disk
-* the latency when doing inference on single samples
-* the throughput when doing inference on batches of data
-* and the test accuracy
+## Part 1: CLIP ViT-L/14 Image Encoder (CPU)
+
+The ViT-L/14 model is the computationally expensive part of the pipeline. It processes raw images (224×224) through a Vision Transformer to produce 768-dimensional embeddings. Let's measure its performance on CPU in **eager mode** first.
 
 :::
 
-
 ::: {.cell .markdown}
 
-#### Model size
+#### ViT model size
 
-We'll start with model size. Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_size = os.path.getsize(model_path) 
-print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
+# CLIP downloads the ViT model to ~/.cache/clip/
+clip_cache_dir = os.path.expanduser("~/.cache/clip")
+vit_model_file = os.path.join(clip_cache_dir, "ViT-L-14.pt")
+if os.path.exists(vit_model_file):
+    vit_model_size = os.path.getsize(vit_model_file)
+    print(f"ViT-L/14 Model Size on Disk: {vit_model_size / (1e6):.2f} MB")
+else:
+    print(f"ViT model file not found at {vit_model_file}")
+    # Estimate from parameters
+    vit_params = sum(p.numel() * p.element_size() for p in clip_model.visual.parameters())
+    print(f"ViT-L/14 Visual Encoder Size (in memory): {vit_params / (1e6):.2f} MB")
+```
+:::
+
+::: {.cell .markdown}
+
+#### ViT single-image latency (eager mode)
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 100
+
+# Get a single preprocessed image
+single_image, _ = next(iter(test_loader))
+single_image = single_image[:1].to(device)
+
+# Warm-up
+with torch.no_grad():
+    clip_model.encode_image(single_image)
+
+vit_latencies_eager = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        clip_model.encode_image(single_image)
+        latencies_i = time.time() - start_time
+        vit_latencies_eager.append(latencies_i)
+
+print("ViT-L/14 Single Image Latency (Eager, CPU):")
+print(f"  Median: {np.percentile(vit_latencies_eager, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(vit_latencies_eager, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(vit_latencies_eager, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(vit_latencies_eager):.2f} FPS")
+```
+:::
+
+::: {.cell .markdown}
+
+#### ViT batch throughput (eager mode)
+
+We'll test with a batch of 32 images (matching our DataLoader batch size).
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+num_batches = 50
+batch_images, _ = next(iter(test_loader))
+batch_images = batch_images.to(device)
+
+# Warm-up
+with torch.no_grad():
+    clip_model.encode_image(batch_images)
+
+vit_batch_times_eager = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        clip_model.encode_image(batch_images)
+        vit_batch_times_eager.append(time.time() - start_time)
+
+vit_batch_fps_eager = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_eager)
+print(f"ViT-L/14 Batch Throughput (Eager, CPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
+```
+:::
+
+
+::: {.cell .markdown}
+
+#### ViT compiled mode (CPU)
+
+Now let's compile the ViT visual encoder into a graph and see if we get a speedup. Graph compilation can fuse operations and optimize memory access patterns.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Compile the visual encoder
+clip_model.visual = torch.compile(clip_model.visual)
+
+# Warm-up (first call triggers compilation, which is slow)
+print("Compiling ViT visual encoder (this may take a moment)...")
+with torch.no_grad():
+    clip_model.encode_image(single_image)
+print("Compilation complete.")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Single-image latency (compiled)
+vit_latencies_compiled = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        clip_model.encode_image(single_image)
+        vit_latencies_compiled.append(time.time() - start_time)
+
+print("ViT-L/14 Single Image Latency (Compiled, CPU):")
+print(f"  Median: {np.percentile(vit_latencies_compiled, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(vit_latencies_compiled, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(vit_latencies_compiled, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(vit_latencies_compiled):.2f} FPS")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Batch throughput (compiled)
+vit_batch_times_compiled = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        clip_model.encode_image(batch_images)
+        vit_batch_times_compiled.append(time.time() - start_time)
+
+vit_batch_fps_compiled = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_compiled)
+print(f"ViT-L/14 Batch Throughput (Compiled, CPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
+```
+:::
+
+::: {.cell .markdown}
+
+#### ViT CPU summary
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 60)
+print("CLIP ViT-L/14 CPU Benchmark Summary")
+print("=" * 60)
+print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
+print("-" * 60)
+print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>8.2f}")
+print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>8.2f} {num_trials/np.sum(vit_latencies_compiled):>8.2f}")
+print(f"{'Batch throughput (FPS, batch_size=32)':<45} {vit_batch_fps_eager:>8.2f} {vit_batch_fps_compiled:>8.2f}")
+```
+:::
+
+
+::: {.cell .markdown}
+
+---
+
+## Part 2: Aesthetic MLP Head (CPU)
+
+Now we'll benchmark the lightweight MLP head that maps 768-dim CLIP embeddings to aesthetic scores. Since we'll compare eager vs compiled mode, we'll first reload the models fresh.
+
+:::
+
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Reload CLIP (uncompiled) and MLP for clean benchmarking
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+model = torch.load(model_path, map_location=device, weights_only=False)
+model.eval()
+```
+:::
+
+
+::: {.cell .markdown}
+
+#### MLP model size
+
+Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+mlp_model_size = os.path.getsize(model_path) 
+print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
 ```
 :::
 
@@ -98,7 +292,7 @@ print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 
 #### Sample predictions
 
-Next, we'll verify the model produces reasonable aesthetic scores. The MLP head takes CLIP ViT-L/14 embeddings (768-dim, L2-normalized) and outputs aesthetic quality scores (0-10).
+Let's verify the model produces reasonable aesthetic scores.
 
 :::
 
@@ -125,20 +319,18 @@ print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")
 ```
 :::
 
-
-
 ::: {.cell .markdown}
 
-#### Inference latency
+#### MLP inference latency (eager mode)
 
-Now, we'll measure how long it takes the model to return a prediction for a single sample. We will run 100 trials, and then compute aggregate statistics.
+We pre-compute a CLIP embedding, then measure only the MLP forward pass.
 
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-num_trials = 100  # Number of trials
+num_trials = 100
 
 # Pre-compute a single CLIP embedding for benchmarking MLP latency
 with torch.no_grad():
@@ -150,39 +342,36 @@ with torch.no_grad():
 with torch.no_grad():
     model(single_embedding)
 
-latencies = []
+mlp_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
         start_time = time.time()
         _ = model(single_embedding)
-        latencies.append(time.time() - start_time)
+        mlp_latencies_eager.append(time.time() - start_time)
 ```
 :::
-
-
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
-print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+print("MLP Single Sample Latency (Eager, CPU):")
+print(f"  Median: {np.percentile(mlp_latencies_eager, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(mlp_latencies_eager, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(mlp_latencies_eager, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(mlp_latencies_eager):.2f} FPS")
 ```
 :::
 
 ::: {.cell .markdown}
 
-#### Batch throughput 
-
-Finally, we'll measure the rate at which the model can return predictions for batches of data. 
+#### MLP batch throughput (eager mode)
 
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-num_batches = 50  # Number of trials
+num_batches = 50
 
 # Pre-compute a batch of CLIP embeddings for benchmarking MLP throughput
 with torch.no_grad():
@@ -194,146 +383,191 @@ with torch.no_grad():
 with torch.no_grad():
     model(batch_embeddings)
 
-batch_times = []
+mlp_batch_times_eager = []
 with torch.no_grad():
     for _ in range(num_batches):
         start_time = time.time()
         _ = model(batch_embeddings)
-        batch_times.append(time.time() - start_time)
-```
-:::
+        mlp_batch_times_eager.append(time.time() - start_time)
 
-::: {.cell .code}
-```python
-# runs in jupyter container on node-serve-model
-batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
-print(f"Batch Throughput: {batch_fps:.2f} FPS")
+mlp_batch_fps_eager = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_eager)
+print(f"MLP Batch Throughput (Eager, CPU, batch_size=32): {mlp_batch_fps_eager:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### Summary of results
+#### MLP compiled mode (CPU)
 
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
-print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
-print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
-print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
-print(f"Batch Throughput: {batch_fps:.2f} FPS")
+model = torch.compile(model)
+
+# Warm-up (triggers compilation)
+print("Compiling MLP model (this may take a moment)...")
+with torch.no_grad():
+    model(single_embedding)
+print("Compilation complete.")
 ```
 :::
 
-<!-- 
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+mlp_latencies_compiled = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        _ = model(single_embedding)
+        mlp_latencies_compiled.append(time.time() - start_time)
 
-compute_gigaio 
+print("MLP Single Sample Latency (Compiled, CPU):")
+print(f"  Median: {np.percentile(mlp_latencies_compiled, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(mlp_latencies_compiled, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(mlp_latencies_compiled, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(mlp_latencies_compiled):.2f} FPS")
+```
+:::
 
-  Model name:             AMD EPYC 7763 64-Core Processor
-    CPU family:           25
-    Model:                1
-    Thread(s) per core:   2
-    Core(s) per socket:   64
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+mlp_batch_times_compiled = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        _ = model(batch_embeddings)
+        mlp_batch_times_compiled.append(time.time() - start_time)
 
--->
-
-
-<!-- summary for aesthetic_mlp model
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 60.16 ms
-Inference Latency (single sample, 95th percentile): 77.22 ms
-Inference Latency (single sample, 99th percentile): 77.37 ms
-Inference Throughput (single sample): 15.82 FPS
-Batch Throughput: 83.66 FPS
-
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 73.97 ms
-Inference Latency (single sample, 95th percentile): 83.16 ms
-Inference Latency (single sample, 99th percentile): 83.94 ms
-Inference Throughput (single sample): 13.34 FPS
-Batch Throughput: 98.80 FPS
-
--->
-
-
-<!-- summary for aesthetic_mlp compiled model
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 26.92 ms
-Inference Latency (single sample, 95th percentile): 49.79 ms
-Inference Latency (single sample, 99th percentile): 64.55 ms
-Inference Throughput (single sample): 32.35 FPS
-Batch Throughput: 249.08 FPS
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 34.14 ms
-Inference Latency (single sample, 95th percentile): 53.85 ms
-Inference Latency (single sample, 99th percentile): 60.23 ms
-Inference Throughput (single sample): 27.39 FPS
-Batch Throughput: 281.65 FPS
-
--->
-
-<!-- 
-
-(Intel CPU)
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 12.69 ms
-Inference Latency (single sample, 95th percentile): 12.83 ms
-Inference Latency (single sample, 99th percentile): 12.97 ms
-Inference Throughput (single sample): 78.73 FPS
-Batch Throughput: 161.27 FPS
-
-With compiling
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 8.47 ms
-Inference Latency (single sample, 95th percentile): 8.58 ms
-Inference Latency (single sample, 99th percentile): 8.79 ms
-Inference Throughput (single sample): 117.86 FPS
-Batch Throughput: 474.67 FPS
+mlp_batch_fps_compiled = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_compiled)
+print(f"MLP Batch Throughput (Compiled, CPU, batch_size=32): {mlp_batch_fps_compiled:.2f} FPS")
+```
+:::
 
 
+::: {.cell .markdown}
 
--->
+#### MLP CPU summary
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 60)
+print("Aesthetic MLP Head CPU Benchmark Summary")
+print("=" * 60)
+print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
+print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
+print()
+print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
+print("-" * 60)
+print(f"{'Single sample latency (median, ms)':<45} {np.percentile(mlp_latencies_eager, 50)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 50)*1000:>8.2f}")
+print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(mlp_latencies_eager, 95)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single sample throughput (FPS)':<45} {num_trials/np.sum(mlp_latencies_eager):>8.2f} {num_trials/np.sum(mlp_latencies_compiled):>8.2f}")
+print(f"{'Batch throughput (FPS, batch_size=32)':<45} {mlp_batch_fps_eager:>8.2f} {mlp_batch_fps_compiled:>8.2f}")
+```
+:::
+
+::: {.cell .markdown}
+
+---
+
+## Part 3: End-to-End Pipeline (CPU)
+
+Finally, let's measure the full pipeline: image → ViT → normalize → MLP → score. This shows the total latency a user would experience. We'll reload fresh (uncompiled) models.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Reload uncompiled models for E2E measurement
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+model = torch.load(model_path, map_location=device, weights_only=False)
+model.eval()
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 50
+
+# Single image E2E
+single_image = single_image[:1].to(device)
+
+# Warm-up
+with torch.no_grad():
+    feat = clip_model.encode_image(single_image)
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+    model(emb)
+
+e2e_latencies = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = model(emb)
+        e2e_latencies.append(time.time() - start_time)
+
+print("End-to-End Single Image Latency (CPU):")
+print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Batch E2E
+batch_images, _ = next(iter(test_loader))
+batch_images = batch_images.to(device)
+
+e2e_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = model(emb)
+        e2e_batch_times.append(time.time() - start_time)
+
+e2e_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_batch_times)
+print(f"End-to-End Batch Throughput (CPU, batch_size=32): {e2e_batch_fps:.2f} FPS")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Latency breakdown
+vit_median = np.percentile(vit_latencies_eager, 50) * 1000
+mlp_median = np.percentile(mlp_latencies_eager, 50) * 1000
+e2e_median = np.percentile(e2e_latencies, 50) * 1000
+
+print("=" * 50)
+print("End-to-End Latency Breakdown (CPU, single image)")
+print("=" * 50)
+print(f"  ViT encode:    {vit_median:.2f} ms ({vit_median/e2e_median*100:.1f}%)")
+print(f"  MLP forward:   {mlp_median:.2f} ms ({mlp_median/e2e_median*100:.1f}%)")
+print(f"  E2E total:     {e2e_median:.2f} ms")
+print()
+print("The ViT encoder dominates the pipeline cost.")
+print("Optimizing the MLP (ONNX, quantization, etc.) will")
+print("improve MLP latency, but the total pipeline speedup")
+print("depends primarily on the ViT encoder performance.")
+```
+:::
 
 ::: {.cell .markdown}
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
-
-:::
-
-
-::: {.cell .markdown}
-
-### Eager mode execution vs compiled model
-
-We had just evaluated a model in eager mode. However, in some (although, not all) cases we may get better performance from compiling the model into a graph, and executing it as a graph.
-
-Go back to the cell where the model is loaded, and add
-
-```python
-model.compile()
-```
-
-just below the call to `torch.load`. Then, run the notebook again ("Run > Run All Cells"). 
-
-When you are done, download the fully executed notebook **again** from the Jupyter container environment for later reference.
-
 
 :::
