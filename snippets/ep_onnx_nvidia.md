@@ -25,7 +25,7 @@ Build the GPU image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f serve-model-chi/docker/Dockerfile.jupyter-onnx-nvidia .
+docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
 Then launch a new one with the GPU image:
@@ -35,7 +35,7 @@ Then launch a new one with the GPU image:
 docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
@@ -499,7 +499,7 @@ Build the OpenVINO image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-openvino -f serve-model-chi/docker/Dockerfile.jupyter-onnx-openvino .
+docker build -t jupyter-onnx-openvino -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-openvino .
 ```
 
 Then, launch a container with the OpenVINO image:
@@ -508,7 +508,7 @@ Then, launch a container with the OpenVINO image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \

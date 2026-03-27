@@ -82,7 +82,7 @@ At the beginning of your GPU lease time, you will continue with the next step, i
 * Use this link: [Model optimizations for serving machine learning models](https://chameleoncloud.org/experiment/share/f5acccf8-f2cb-4d1e-8918-4c8fd97bfc32) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
-Inside the `serve-model-chi` directory, continue with `2_create_server.ipynb`.
+Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
 
 
 
@@ -183,7 +183,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone https://github.com/teaching-on-testbeds/serve-model-chi")
+s.execute("git clone https://github.com/somadisingh/model-serving-nvidia")
 ```
 
 
@@ -256,7 +256,7 @@ Then, to populate it with data, run
 
 ```bash
 # runs on node-serve-model
-docker compose -f serve-model-chi/docker/docker-compose-data.yaml up -d
+docker compose -f model-serving-nvidia/docker/docker-compose-data.yaml up -d
 ```
 
 This will run a temporary container that downloads the aesthetic scoring dataset from HuggingFace, extracts it in the volume, and then stops. It may take a few minutes depending on your connection speed (the dataset is ~3.3 GB). You can verify with 
@@ -285,7 +285,7 @@ Inside the SSH session, build the `jupyter-onnx-base` image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-base -f serve-model-chi/docker/Dockerfile.jupyter-onnx-base .
+docker build -t jupyter-onnx-base -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-base .
 ```
 
 Then, launch a container from the `jupyter-onnx-base` image:
@@ -294,7 +294,7 @@ Then, launch a container from the `jupyter-onnx-base` image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
@@ -1733,7 +1733,7 @@ Build the GPU image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f serve-model-chi/docker/Dockerfile.jupyter-onnx-nvidia .
+docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
 Then launch a new one with the GPU image:
@@ -1743,7 +1743,7 @@ Then launch a new one with the GPU image:
 docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
@@ -2161,7 +2161,7 @@ Build the OpenVINO image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-openvino -f serve-model-chi/docker/Dockerfile.jupyter-onnx-openvino .
+docker build -t jupyter-onnx-openvino -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-openvino .
 ```
 
 Then, launch a container with the OpenVINO image:
@@ -2170,7 +2170,7 @@ Then, launch a container with the OpenVINO image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \

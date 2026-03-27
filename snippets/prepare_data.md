@@ -22,7 +22,7 @@ Then, to populate it with data, run
 
 ```bash
 # runs on node-serve-model
-docker compose -f serve-model-chi/docker/docker-compose-data.yaml up -d
+docker compose -f model-serving-nvidia/docker/docker-compose-data.yaml up -d
 ```
 
 This will run a temporary container that downloads the aesthetic scoring dataset from HuggingFace, extracts it in the volume, and then stops. It may take a few minutes depending on your connection speed (the dataset is ~3.3 GB). You can verify with 
