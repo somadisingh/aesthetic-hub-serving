@@ -33,24 +33,47 @@ import numpy as np
 import torch
 import onnx
 import onnxruntime as ort
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torchvision import datasets
+from torch.utils.data import DataLoader, TensorDataset
+import clip
 ```
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare test dataset
+# Load CLIP model for computing image embeddings
+device = torch.device("cpu")
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Prepare test dataset using CLIP's preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute CLIP embeddings for benchmarking
+print("Pre-computing CLIP embeddings for benchmark data...")
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
+    single_embedding = batch_embeddings[:1]
+print(f"Embeddings shape: {batch_embeddings.shape}")
 ```
 :::
 
@@ -62,36 +85,24 @@ def benchmark_session(ort_session):
 
     print(f"Execution provider: {ort_session.get_providers()}")
 
-    ## Benchmark accuracy
+    ## Sample predictions
 
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images_np = images.numpy()
-        outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-        predicted = np.argmax(outputs, axis=1)
-        total += labels.size(0)
-        correct += (predicted == labels.numpy()).sum()
-    accuracy = (correct / total) * 100
-
-    print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
 
     ## Benchmark inference latency for single sample
 
     num_trials = 100  # Number of trials
 
-    # Get a single sample from the test data
-
-    single_sample, _ = next(iter(test_loader))  
-    single_sample = single_sample[:1].numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
 
     latencies = []
     for _ in range(num_trials):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
         latencies.append(time.time() - start_time)
 
     print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
@@ -103,20 +114,16 @@ def benchmark_session(ort_session):
 
     num_batches = 50  # Number of trials
 
-    # Get a batch from the test data
-    batch_input, _ = next(iter(test_loader))  
-    batch_input = batch_input.numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
 
     batch_times = []
     for _ in range(num_batches):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
         batch_times.append(time.time() - start_time)
 
-    batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
 
 ```
@@ -356,7 +363,7 @@ Inference Throughput (single sample): 35.28 FPS
 
 Next, we will try static quantization with a calibration dataset. 
 
-First, let's prepare the calibration dataset. This dataset will also be used to evaluate the quantized model, to see if it meets the accuracy criterion we will set.
+First, let's prepare the calibration dataset by pre-computing CLIP embeddings from the validation images. Since the ONNX model expects 768-dim embedding inputs, our calibration data must be in the same format.
 
 :::
 
@@ -365,31 +372,36 @@ First, let's prepare the calibration dataset. This dataset will also be used to 
 # runs in jupyter container on node-serve-model
 import neural_compressor
 from neural_compressor import quantization
-from torchvision import datasets, transforms
 ```
 :::
-
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
+# Pre-compute CLIP embeddings for calibration/evaluation
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=clip_preprocess)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-# Load dataset
-val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=val_test_transform)
-eval_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=val_dataset)
+print("Pre-computing CLIP embeddings for calibration data...")
+cal_embeddings = []
+with torch.no_grad():
+    for images, _ in val_loader:
+        features = clip_model.encode_image(images.to(device))
+        embs = normalized(features.cpu().numpy()).astype(np.float32)
+        cal_embeddings.append(embs)
+cal_embeddings = np.vstack(cal_embeddings)
+print(f"Calibration embeddings shape: {cal_embeddings.shape}")
+
+# Wrap embeddings in a dataset for INC
+cal_dataset = TensorDataset(torch.from_numpy(cal_embeddings), torch.zeros(len(cal_embeddings)))
+cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=cal_dataset)
 ```
 :::
 
 ::: {.cell .markdown}
 
-Then, we'll configure the quantizer. We'll start with a more aggressive quantization strategy - we will prefer to quantize as much as possible, as long as the accuracy of the quantized model is not more than **0.05** less than the accuracy of the original FP32 model.
+Then, we'll configure the quantizer. We'll start with a more aggressive quantization strategy, quantizing as much as possible.
 
 
 :::
@@ -402,12 +414,8 @@ Then, we'll configure the quantizer. We'll start with a more aggressive quantiza
 model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
-# Configure the quantizer
+# Configure the quantizer - aggressive static quantization
 config_ptq = neural_compressor.PostTrainingQuantConfig(
-    accuracy_criterion = neural_compressor.config.AccuracyCriterion(
-        criterion="absolute",  
-        tolerable_loss=0.05  # We will tolerate up to 0.05 less accuracy in the quantized model
-    ),
     approach="static", 
     device='cpu', 
     quant_level=1,
@@ -416,13 +424,11 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
     calibration_sampling_size=128
 )
 
-# Find the best quantized model meeting the accuracy criterion
+# Fit the quantized model using calibration data
 q_model = quantization.fit(
     model=fp32_model, 
     conf=config_ptq, 
-    calib_dataloader=eval_dataloader,
-    eval_dataloader=eval_dataloader, 
-    eval_metric=neural_compressor.metric.Metric(name='topk')
+    calib_dataloader=cal_dataloader
 )
 
 # Save quantized model
@@ -512,9 +518,7 @@ Batch Throughput: 2057.18 FPS
 
 ::: {.cell .markdown}
 
-Let's try a more conservative approach to static quantization next - we'll allow an accuracy loss only up to **0.01**. 
-
-This time, we will see that the quantizer tries a few different "recipes" - in many of them, only some of the operations are quantized, in order to try and reach the target accuracy. After each tuning attempt, it tests the quantized model on the evaluation dataset, to see if it meets the accuracy criterion; if not, it tries again.
+Let's try a more conservative approach to static quantization next, with a lower quantization level. With `quant_level=0`, fewer operations are quantized, which typically preserves more of the original model's output fidelity at the cost of less compression.
 
 :::
 
@@ -526,12 +530,8 @@ This time, we will see that the quantizer tries a few different "recipes" - in m
 model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
-# Configure the quantizer
+# Configure the quantizer - conservative static quantization
 config_ptq = neural_compressor.PostTrainingQuantConfig(
-    accuracy_criterion = neural_compressor.config.AccuracyCriterion(
-        criterion="absolute",  
-        tolerable_loss=0.01  # We will tolerate up to 0.01 less accuracy in the quantized model
-    ),
     approach="static", 
     device='cpu', 
     quant_level=0,  # 0 is a less aggressive quantization level
@@ -540,13 +540,11 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
     calibration_sampling_size=128
 )
 
-# Find the best quantized model meeting the accuracy criterion
+# Fit the quantized model
 q_model = quantization.fit(
     model=fp32_model, 
     conf=config_ptq, 
-    calib_dataloader=eval_dataloader,
-    eval_dataloader=eval_dataloader, 
-    eval_metric=neural_compressor.metric.Metric(name='topk')
+    calib_dataloader=cal_dataloader
 )
 
 # Save quantized model

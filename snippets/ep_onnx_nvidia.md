@@ -19,24 +19,35 @@ import numpy as np
 import torch
 import onnx
 import onnxruntime as ort
-from torchvision import datasets, transforms
+from torchvision import datasets
 from torch.utils.data import DataLoader
+import clip
 ```
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare test dataset
+# Load CLIP model for computing image embeddings
+device = torch.device("cpu")
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+
+# Prepare test dataset with CLIP preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+# Pre-compute CLIP embeddings for benchmarking
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
+    single_embedding = batch_embeddings[:1]
 ```
 :::
 
@@ -48,36 +59,24 @@ def benchmark_session(ort_session):
 
     print(f"Execution provider: {ort_session.get_providers()}")
 
-    ## Benchmark accuracy
+    ## Sample predictions
 
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images_np = images.numpy()
-        outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-        predicted = np.argmax(outputs, axis=1)
-        total += labels.size(0)
-        correct += (predicted == labels.numpy()).sum()
-    accuracy = (correct / total) * 100
-
-    print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
 
     ## Benchmark inference latency for single sample
 
     num_trials = 100  # Number of trials
 
-    # Get a single sample from the test data
-
-    single_sample, _ = next(iter(test_loader))  
-    single_sample = single_sample[:1].numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
 
     latencies = []
     for _ in range(num_trials):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
         latencies.append(time.time() - start_time)
 
     print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
@@ -89,20 +88,16 @@ def benchmark_session(ort_session):
 
     num_batches = 50  # Number of trials
 
-    # Get a batch from the test data
-    batch_input, _ = next(iter(test_loader))  
-    batch_input = batch_input.numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
 
     batch_times = []
     for _ in range(num_batches):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
         batch_times.append(time.time() - start_time)
 
-    batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
 
 ```

@@ -26,23 +26,32 @@ import numpy as np
 import torch
 import onnx
 import onnxruntime as ort
-from torchvision import datasets, transforms
+from torchvision import datasets
 from torch.utils.data import DataLoader
+import clip
 ```
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare test dataset
+# Load CLIP model for computing image embeddings
+device = torch.device("cpu")
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Prepare test dataset using CLIP's preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -63,8 +72,8 @@ device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 
 onnx_model_path = "models/aesthetic_mlp.onnx"
-# dummy input - used to clarify the input shape
-dummy_input = torch.randn(1, 3, 224, 224)  
+# MLP expects a 768-dim CLIP embedding as input
+dummy_input = torch.randn(1, 768)
 torch.onnx.export(model, dummy_input, onnx_model_path,
                   export_params=True, opset_version=20,
                   do_constant_folding=True, input_names=['input'],
@@ -132,32 +141,34 @@ ort_session.get_providers()
 
 ::: {.cell .markdown}
 
-#### Test accuracy
+#### Sample predictions
 
 
-First, let's measure accuracy on the test set:
+First, let's verify the model produces reasonable aesthetic scores:
 
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-correct = 0
-total = 0
-for images, labels in test_loader:
-    images_np = images.numpy()
-    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-    predicted = np.argmax(outputs, axis=1)
-    total += labels.size(0)
-    correct += (predicted == labels.numpy()).sum()
-accuracy = (correct / total) * 100
+with torch.no_grad():
+    images, _ = next(iter(test_loader))
+    image_features = clip_model.encode_image(images.to(device))
+    embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: embeddings})[0]
+    scores = outputs.flatten()
+    mean_score = scores.mean()
+    std_score = scores.std()
 ```
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+print("Sample predicted aesthetic scores (0-10):")
+for i in range(min(5, len(scores))):
+    print(f"  Image {i+1}: {scores[i]:.2f}")
+print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")
 ```
 :::
 
@@ -193,18 +204,19 @@ Now, we'll measure how long it takes the model to return a prediction for a sing
 # runs in jupyter container on node-serve-model
 num_trials = 100  # Number of trials
 
-# Get a single sample from the test data
-
-single_sample, _ = next(iter(test_loader))  
-single_sample = single_sample[:1].numpy()
+# Pre-compute a single CLIP embedding for benchmarking
+with torch.no_grad():
+    sample_image, _ = next(iter(test_loader))
+    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
-ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
 
 latencies = []
 for _ in range(num_trials):
     start_time = time.time()
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
     latencies.append(time.time() - start_time)
 ```
 :::
@@ -234,17 +246,19 @@ Finally, we'll measure the rate at which the model can return predictions for ba
 # runs in jupyter container on node-serve-model
 num_batches = 50  # Number of trials
 
-# Get a batch from the test data
-batch_input, _ = next(iter(test_loader))  
-batch_input = batch_input.numpy()
+# Pre-compute a batch of CLIP embeddings for benchmarking
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
-ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
 
 batch_times = []
 for _ in range(num_batches):
     start_time = time.time()
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
     batch_times.append(time.time() - start_time)
 ```
 :::
@@ -252,7 +266,7 @@ for _ in range(num_batches):
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
+batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
 print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ```
 :::
@@ -268,7 +282,7 @@ print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
 print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
