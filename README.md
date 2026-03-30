@@ -1,6 +1,6 @@
 # Model Optimizations for Aesthetic Score Prediction
 
-This lab benchmarks and optimizes a two-stage image aesthetic scoring pipeline on NVIDIA GPU hardware (A100/A30) and AMD EPYC 7763 CPU.
+This lab benchmarks and optimizes a two-stage image aesthetic scoring pipeline on NVIDIA GPU hardware (A100/A30) and AMD EPYC 7763 CPU. It can be accessed [here](https://trovi.chameleoncloud.org/dashboard/artifacts/c347ab71-1a5b-41cf-a2fd-0c34d30f1e1d/).
 
 ## Pipeline
 
