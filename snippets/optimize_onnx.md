@@ -58,7 +58,7 @@ def normalized(a, axis=-1, order=2):
 # runs in jupyter container on node-serve-model
 # Prepare test dataset using CLIP's preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 ```
 :::
@@ -138,15 +138,15 @@ def benchmark_session(ort_session):
 
 Let's start by applying some basic [graph optimizations](https://onnxruntime.ai/docs/performance/model-optimizations/graph-optimizations.html#onlineoffline-mode), e.g. fusing operations. 
 
-We will save the model after applying graph optimizations to `models/aesthetic_mlp_optimized.onnx`, then evaluate that model in a new session.
+We will save the model after applying graph optimizations to `models/flickr_global_optimized.onnx`, then evaluate that model in a new session.
 
 :::
 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
-optimized_model_path = "models/aesthetic_mlp_optimized.onnx"
+onnx_model_path = "models/flickr_global.onnx"
+optimized_model_path = "models/flickr_global_optimized.onnx"
 
 session_options = ort.SessionOptions()
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED # apply graph optimizations
@@ -159,10 +159,10 @@ ort_session = ort.InferenceSession(onnx_model_path, sess_options=session_options
 
 ::: {.cell .markdown}
 
-Download the `aesthetic_mlp_optimized.onnx` model from inside the `models` directory. 
+Download the `flickr_global_optimized.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_optimized.onnx` and see what has changed in the "optimized" graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `flickr_global.onnx` and review the graph. Then, upload the `flickr_global_optimized.onnx` and see what has changed in the "optimized" graph.
 
 :::
 
@@ -177,7 +177,7 @@ Next, evaluate the optimized model. The graph optimizations may improve the infe
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_optimized.onnx"
+onnx_model_path = "models/flickr_global_optimized.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -266,7 +266,7 @@ from neural_compressor import quantization
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/aesthetic_mlp.onnx"
+model_path = "models/flickr_global.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer
@@ -281,17 +281,17 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/aesthetic_mlp_quantized_dynamic.onnx")
+q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-Download the `aesthetic_mlp_quantized_dynamic.onnx` model from inside the `models` directory. 
+Download the `flickr_global_quantized_dynamic.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_dynamic.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `flickr_global_quantized_dynamic.onnx` and see what has changed in the quantized graph.
 
 Note that some of our operations have become integer operations, but we have added additional operations to quantize and dequantize activations throughout the graph. 
 
@@ -306,7 +306,7 @@ We are also concerned with the size of the quantized model on disk:
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
+onnx_model_path = "models/flickr_global_quantized_dynamic.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -324,7 +324,7 @@ Next, evaluate the quantized model. Since we are saving weights in integer form,
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
+onnx_model_path = "models/flickr_global_quantized_dynamic.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -380,7 +380,7 @@ from neural_compressor import quantization
 # runs in jupyter container on node-serve-model
 # Pre-compute CLIP embeddings for calibration/evaluation
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
-val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=clip_preprocess)
+val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), transform=clip_preprocess)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
 print("Pre-computing CLIP embeddings for calibration data...")
@@ -411,7 +411,7 @@ Then, we'll configure the quantizer. We'll start with a more aggressive quantiza
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/aesthetic_mlp.onnx"
+model_path = "models/flickr_global.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer - aggressive static quantization
@@ -432,16 +432,16 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/aesthetic_mlp_quantized_aggressive.onnx")
+q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
 ```
 :::
 
 ::: {.cell .markdown}
 
-Download the `aesthetic_mlp_quantized_aggressive.onnx` model from inside the `models` directory. 
+Download the `flickr_global_quantized_aggressive.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_aggressive.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `flickr_global_quantized_aggressive.onnx` and see what has changed in the quantized graph.
 
 Note that within the parameters for each quantized operation, we now have a "scale" and "zero point" - these are used to convert the FP32 values to INT8 values, as described above. The optimal scale and zero point for weights is determined by the fitted weights themselves, but the calibration dataset was required to find the optimal scale and zero point for activations.
 
@@ -458,7 +458,7 @@ Let's get the size of the quantized model on disk:
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
+onnx_model_path = "models/flickr_global_quantized_aggressive.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -475,7 +475,7 @@ Next, evaluate the quantized model.
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
+onnx_model_path = "models/flickr_global_quantized_aggressive.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -527,7 +527,7 @@ Let's try a more conservative approach to static quantization next, with a lower
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/aesthetic_mlp.onnx"
+model_path = "models/flickr_global.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer - conservative static quantization
@@ -548,16 +548,16 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/aesthetic_mlp_quantized_conservative.onnx")
+q_model.save_model_to_file("models/flickr_global_quantized_conservative.onnx")
 ```
 :::
 
 ::: {.cell .markdown}
 
-Download the `aesthetic_mlp_quantized_conservative.onnx` model from inside the `models` directory. 
+Download the `flickr_global_quantized_conservative.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `aesthetic_mlp_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
+To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `flickr_global_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
 
 In this graph, since only some operations are quantized, we have a "Quantize" node before each quantized operation in the graph, and a "Dequantize" node after.
 
@@ -575,7 +575,7 @@ Let's get the size of the quantized model on disk:
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
+onnx_model_path = "models/flickr_global_quantized_conservative.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -596,7 +596,7 @@ However, these tradeoffs vary from one model to the next, and across implementat
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
+onnx_model_path = "models/flickr_global_quantized_conservative.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```

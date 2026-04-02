@@ -51,7 +51,7 @@ def normalized(a, axis=-1, order=2):
 # runs in jupyter container on node-serve-model
 # Prepare test dataset using CLIP's preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -67,11 +67,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/aesthetic_mlp.pth"  
+model_path = "models/flickr_global_best_inference_only.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 # MLP expects a 768-dim CLIP embedding as input
 dummy_input = torch.randn(1, 768)
 torch.onnx.export(model, dummy_input, onnx_model_path,
@@ -102,7 +102,7 @@ For this first ONNX baseline, we will explicitly disable graph optimizations, so
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 ```
 :::
 
@@ -375,6 +375,6 @@ Batch Throughput: 2519.80 FPS
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
-Also download the `aesthetic_mlp.onnx` model from inside the `models` directory.
+Also download the `flickr_global.onnx` model from inside the `models` directory.
 
 :::

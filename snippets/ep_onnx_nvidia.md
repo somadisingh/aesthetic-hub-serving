@@ -97,7 +97,7 @@ def normalized(a, axis=-1, order=2):
 
 # Prepare test dataset with CLIP preprocessing
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), transform=clip_preprocess)
 ```
 :::
 
@@ -266,7 +266,7 @@ Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → ML
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load MLP on CPU
-mlp_model = torch.load("models/aesthetic_mlp.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model = torch.load("models/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False)
 mlp_model.eval()
 
 num_trials = 50
@@ -422,7 +422,7 @@ First, for reference, we'll run the MLP ONNX model with the `CPUExecutionProvide
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -445,7 +445,7 @@ Next, we'll try the CUDA execution provider, which will execute the MLP model on
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -469,7 +469,7 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -541,7 +541,7 @@ Run the cells at the top, which `import` libraries, set up the data loaders, and
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/aesthetic_mlp.onnx"
+onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()

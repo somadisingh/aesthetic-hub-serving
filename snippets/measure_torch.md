@@ -41,7 +41,7 @@ First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute imag
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/aesthetic_mlp.pth"  
+model_path = "models/flickr_global_best_inference_only.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 model.eval()
@@ -66,7 +66,7 @@ and also prepare our test dataset, using CLIP's own preprocessing:
 ```python
 # runs in jupyter container on node-serve-model
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
-test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -277,7 +277,7 @@ model.eval()
 
 #### MLP model size
 
-Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
+Our `flickr_global_best_inference_only.pth` is a lightweight MLP head (768 → 512 → 128 → 32 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
 :::
 
 ::: {.cell .code}
