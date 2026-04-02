@@ -28,13 +28,31 @@ services:
         echo "Downloading split manifests from Google Drive..."
         gdown --folder "1FL8zexo-ku8qPvUX9WYaMy35dkRl1IcK" -O /data/flickr-aes/splits
 
-        echo "Creating ImageFolder structure for benchmarking..."
-        mkdir -p /data/flickr-aes/test/images
-        mkdir -p /data/flickr-aes/validation/images
-        ls 40K/*.jpg | head -500 | while read f; do ln -sf "/data/flickr-aes/$f" /data/flickr-aes/test/images/; done
-        ls 40K/*.jpg | tail -500 | while read f; do ln -sf "/data/flickr-aes/$f" /data/flickr-aes/validation/images/; done
+        echo "Creating inference ImageFolder from CSV splits (test+val+production, 7000 images)..."
+        mkdir -p /data/flickr-aes/inference/images
+        cat > /tmp/build_inference.py << 'PYEOF'
+        import csv, os, random
+        random.seed(42)
+        non_train = []
+        with open('/data/flickr-aes/splits/flickr_global_manifest.csv') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['split'] in ('test', 'val', 'production'):
+                    non_train.append(row['image_name'])
+        random.shuffle(non_train)
+        selected = non_train[:7000]
+        for img in selected:
+            src = os.path.join('../../40K', img)
+            dst = os.path.join('/data/flickr-aes/inference/images', img)
+            if not os.path.exists(dst):
+                os.symlink(src, dst)
+        total = len(os.listdir('/data/flickr-aes/inference/images'))
+        print(f'Inference split: {len(selected)} images selected, {total} symlinked')
+        PYEOF
+        python3 /tmp/build_inference.py
 
         echo "Dataset setup complete."
         echo "Images: $(ls 40K/*.jpg | wc -l) files in 40K/"
         echo "Splits: $(ls splits/)"
+        echo "Inference: $(ls /data/flickr-aes/inference/images/ | wc -l) images"
     restart: "no"
