@@ -12,20 +12,29 @@ services:
       - bash
       - -c
       - |
-        set -e  # Stop on error
+        set -e
+        pip install -q gdown
+
         echo "Creating dataset directory..."
-        mkdir -p /data/aesthetic-hub && cd /data/aesthetic-hub
+        mkdir -p /data/flickr-aes && cd /data/flickr-aes
 
-        echo "Downloading dataset from HuggingFace..."
-        curl -L "https://huggingface.co/datasets/somadisingh/aesthetic-hub/resolve/main/aesthetic-hub-data.zip" --output aesthetic-hub-data.zip
+        echo "Downloading Flickr-AES images (40K.zip) from Google Drive..."
+        gdown "1jY7GMMNaQGQ80AAL99FLrBpWPFCwTKVT" -O 40K.zip
 
-        echo "Extracting dataset..."
-        unzip -q aesthetic-hub-data.zip
-        rm aesthetic-hub-data.zip
+        echo "Extracting images..."
+        unzip -q 40K.zip
+        rm 40K.zip
 
-        echo "Flattening directory structure..."
-        mv aesthetic-hub-data/* .
-        rm -rf aesthetic-hub-data __MACOSX .DS_Store
+        echo "Downloading split manifests from Google Drive..."
+        gdown --folder "1FL8zexo-ku8qPvUX9WYaMy35dkRl1IcK" -O /data/flickr-aes/splits
+
+        echo "Creating ImageFolder structure for benchmarking..."
+        mkdir -p /data/flickr-aes/test/images
+        mkdir -p /data/flickr-aes/validation/images
+        ls 40K/*.jpg | head -500 | while read f; do ln -sf "/data/flickr-aes/$f" /data/flickr-aes/test/images/; done
+        ls 40K/*.jpg | tail -500 | while read f; do ln -sf "/data/flickr-aes/$f" /data/flickr-aes/validation/images/; done
 
         echo "Dataset setup complete."
+        echo "Images: $(ls 40K/*.jpg | wc -l) files in 40K/"
+        echo "Splits: $(ls splits/)"
     restart: "no"

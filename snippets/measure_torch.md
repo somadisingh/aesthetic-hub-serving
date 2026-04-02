@@ -65,7 +65,7 @@ and also prepare our test dataset, using CLIP's own preprocessing:
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```

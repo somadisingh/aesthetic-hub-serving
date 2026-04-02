@@ -57,7 +57,7 @@ def normalized(a, axis=-1, order=2):
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset using CLIP's preprocessing
-data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 ```
@@ -379,7 +379,7 @@ from neural_compressor import quantization
 ```python
 # runs in jupyter container on node-serve-model
 # Pre-compute CLIP embeddings for calibration/evaluation
-data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=clip_preprocess)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 

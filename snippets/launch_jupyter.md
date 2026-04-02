@@ -19,7 +19,7 @@ docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
-    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
+    -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
     jupyter-onnx-base
 ```

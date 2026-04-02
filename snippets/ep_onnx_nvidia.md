@@ -37,7 +37,7 @@ docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
-    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
+    -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
     jupyter-onnx-gpu
 ```
@@ -96,7 +96,7 @@ def normalized(a, axis=-1, order=2):
     return a / np.expand_dims(l2, axis)
 
 # Prepare test dataset with CLIP preprocessing
-data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 ```
 :::
@@ -510,7 +510,7 @@ docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
-    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
+    -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
     jupyter-onnx-openvino
 ```
