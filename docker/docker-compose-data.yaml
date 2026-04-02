@@ -12,20 +12,72 @@ services:
       - bash
       - -c
       - |
-        set -e  # Stop on error
+        set -e
+        pip install -q gdown
+
         echo "Creating dataset directory..."
-        mkdir -p /data/aesthetic-hub && cd /data/aesthetic-hub
+        mkdir -p /data/flickr-aes && cd /data/flickr-aes
 
-        echo "Downloading dataset from HuggingFace..."
-        curl -L "https://huggingface.co/datasets/somadisingh/aesthetic-hub/resolve/main/aesthetic-hub-data.zip" --output aesthetic-hub-data.zip
+        echo "Downloading Flickr-AES images (40K.zip) from Google Drive..."
+        gdown "1jY7GMMNaQGQ80AAL99FLrBpWPFCwTKVT" -O 40K.zip
 
-        echo "Extracting dataset..."
-        unzip -q aesthetic-hub-data.zip
-        rm aesthetic-hub-data.zip
+        echo "Extracting images..."
+        unzip -q 40K.zip
+        rm 40K.zip
 
-        echo "Flattening directory structure..."
-        mv aesthetic-hub-data/* .
-        rm -rf aesthetic-hub-data __MACOSX .DS_Store
+        echo "Downloading split manifests from Google Drive..."
+        gdown --folder "1FL8zexo-ku8qPvUX9WYaMy35dkRl1IcK" -O /data/flickr-aes/splits
+
+        echo "Creating inference ImageFolder from CSV splits (test+val+production, 7000 images)..."
+        mkdir -p /data/flickr-aes/inference/images
+        cat > /tmp/build_inference.py << 'PYEOF'
+        import csv, os, random
+        random.seed(42)
+        non_train = []
+        with open('/data/flickr-aes/splits/flickr_global_manifest.csv') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['split'] in ('test', 'val', 'production'):
+                    non_train.append(row['image_name'])
+        random.shuffle(non_train)
+        selected = non_train[:7000]
+        for img in selected:
+            src = os.path.join('../../40K', img)
+            dst = os.path.join('/data/flickr-aes/inference/images', img)
+            if not os.path.exists(dst):
+                os.symlink(src, dst)
+        total = len(os.listdir('/data/flickr-aes/inference/images'))
+        print(f'Inference split: {len(selected)} images selected, {total} symlinked')
+        PYEOF
+        python3 /tmp/build_inference.py
+
+        echo "Creating personalized inference ImageFolder from CSV splits (non-train, 5000 unique images)..."
+        mkdir -p /data/flickr-aes/inference_personalized/images
+        cat > /tmp/build_inference_personalized.py << 'PYEOF'
+        import csv, os, random
+        random.seed(42)
+        non_train_images = set()
+        with open('/data/flickr-aes/splits/flickr_personalized_manifest.csv') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['split'] in ('test', 'val', 'production_seen', 'production_new_user'):
+                    non_train_images.add(row['image_name'])
+        non_train_images = sorted(non_train_images)
+        random.shuffle(non_train_images)
+        selected = non_train_images[:5000]
+        for img in selected:
+            src = os.path.join('../../40K', img)
+            dst = os.path.join('/data/flickr-aes/inference_personalized/images', img)
+            if not os.path.exists(dst):
+                os.symlink(src, dst)
+        total = len(os.listdir('/data/flickr-aes/inference_personalized/images'))
+        print(f'Personalized inference split: {len(selected)} images selected, {total} symlinked')
+        PYEOF
+        python3 /tmp/build_inference_personalized.py
 
         echo "Dataset setup complete."
+        echo "Images: $(ls 40K/*.jpg | wc -l) files in 40K/"
+        echo "Splits: $(ls splits/)"
+        echo "Inference: $(ls /data/flickr-aes/inference/images/ | wc -l) images"
+        echo "Inference personalized: $(ls /data/flickr-aes/inference_personalized/images/ | wc -l) images"
     restart: "no"
