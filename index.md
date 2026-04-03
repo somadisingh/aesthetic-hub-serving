@@ -1135,6 +1135,244 @@ print("depends primarily on the ViT encoder performance.")
 ```
 
 
+---
+
+## Part 5: Quality Metrics
+
+Performance benchmarks tell you *how fast* the models run. Quality metrics tell you *how well* they predict — essential for right-sizing decisions (no point in ultra-low latency on a model that lacks accuracy).
+
+We run both models over their respective held-out inference sets and compute:
+
+**Global MLP**: MAE, RMSE, PLCC, SRCC, binary accuracy (threshold = 0.5), AUC-ROC  
+**Personalized MLP**: same per-user metrics averaged across users, plus personalization gain vs global
+
+
+```python
+# runs in jupyter container on node-serve-model
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from torchvision import transforms
+from PIL import Image
+import glob
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def collect_global_predictions(manifest_df, image_root, clip_model, mlp_model, device,
+                               clip_preprocess, batch_size=64):
+    """Run the full ViT → MLP pipeline over all images in manifest_df.
+    Returns (preds, targets) as numpy arrays."""
+    preprocess = clip_preprocess
+    preds, targets = [], []
+    rows = manifest_df.reset_index(drop=True)
+
+    for start in range(0, len(rows), batch_size):
+        batch_rows = rows.iloc[start:start + batch_size]
+        imgs = []
+        valid_mask = []
+        for _, row in batch_rows.iterrows():
+            img_path = os.path.join(image_root, row["image_name"])
+            try:
+                img = preprocess(Image.open(img_path).convert("RGB"))
+                imgs.append(img)
+                valid_mask.append(True)
+            except Exception:
+                valid_mask.append(False)
+        if not imgs:
+            continue
+        img_tensor = torch.stack(imgs).to(device)
+        with torch.no_grad():
+            feats = clip_model.encode_image(img_tensor)
+            embs = torch.from_numpy(normalized(feats.cpu().numpy())).float().to(device)
+            scores = mlp_model(embs).squeeze().cpu().numpy()
+        if scores.ndim == 0:
+            scores = scores.reshape(1)
+        gt = batch_rows.loc[[v for v, m in zip(batch_rows.index, valid_mask) if m], "global_score"].values
+        preds.extend(scores.tolist())
+        targets.extend(gt.tolist())
+
+    return np.array(preds), np.array(targets)
+
+
+def print_regression_metrics(preds, targets, label=""):
+    mae  = np.mean(np.abs(preds - targets))
+    rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    plcc, _ = pearsonr(preds, targets)
+    srcc, _ = spearmanr(preds, targets)
+    threshold = 0.5
+    bin_acc = np.mean((preds >= threshold) == (targets >= threshold))
+    try:
+        auc = roc_auc_score((targets >= threshold).astype(int), preds)
+    except ValueError:
+        auc = float("nan")  # only one class present
+
+    print(f"\n{'─'*55}")
+    print(f"Quality metrics — {label}")
+    print(f"{'─'*55}")
+    print(f"  MAE:              {mae:.4f}")
+    print(f"  RMSE:             {rmse:.4f}")
+    print(f"  PLCC:             {plcc:.4f}")
+    print(f"  SRCC:             {srcc:.4f}")
+    print(f"  Binary accuracy:  {bin_acc:.4f}  (threshold={threshold})")
+    print(f"  AUC-ROC:          {auc:.4f}")
+    return dict(mae=mae, rmse=rmse, plcc=plcc, srcc=srcc, bin_acc=bin_acc, auc=auc)
+```
+
+
+### Global MLP — quality metrics
+
+Load the test split from `flickr_global_manifest.csv` and run inference over all held-out images.
+
+
+```python
+# runs in jupyter container on node-serve-model
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
+global_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+
+# Use only the inference (test) split
+global_test = global_manifest[global_manifest["split"] == "inference"].copy()
+image_root_global = os.path.join(data_dir, "40K")
+
+print(f"Global test set: {len(global_test)} images")
+global_test.head()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Reload clean CPU models (without compile artifacts)
+model_eval = torch.load("models/flickr_global_best_inference_only.pth",
+                        map_location=device, weights_only=False)
+model_eval.eval()
+clip_eval, clip_pre_eval = clip.load("ViT-L/14", device=device)
+
+global_preds, global_targets = collect_global_predictions(
+    global_test, image_root_global, clip_eval, model_eval, device, clip_pre_eval
+)
+print(f"Collected {len(global_preds)} predictions")
+global_metrics = print_regression_metrics(global_preds, global_targets, label="Global MLP")
+```
+
+
+### Personalized MLP — quality metrics
+
+For the personalized model we compute metrics per user (using their held-out (image, score) pairs), then average across users.  
+We also compute **personalization gain**: how much the personalized model improves on the global model for the same samples.
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+
+# Use only the inference split
+personal_test = personal_manifest[personal_manifest["split"] == "inference"].copy()
+
+# Use worker_score_norm as ground truth (already in [0,1])
+personal_test = personal_test.rename(columns={"worker_score_norm": "global_score"})
+
+# Build user index mapping (must match training)
+seen_workers = sorted(
+    personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique()
+)
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+
+image_root_personal = os.path.join(data_dir, "40K")
+personal_model_eval = torch.load("models/flickr_personalized_best_inference_only.pth",
+                                  map_location=device, weights_only=False)
+personal_model_eval.eval()
+
+print(f"Personalized test set: {len(personal_test)} rows, "
+      f"{personal_test['worker_id'].nunique()} users")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+per_user_srcc = []
+per_user_mae  = []
+all_personal_preds   = []
+all_personal_targets = []
+all_global_preds_on_personal = []
+
+preprocess = clip_pre_eval
+test_workers = [w for w in personal_test["worker_id"].unique() if w in user2idx]
+
+for worker_id in test_workers:
+    user_rows = personal_test[personal_test["worker_id"] == worker_id].reset_index(drop=True)
+    if len(user_rows) < 3:
+        continue  # skip users with too few samples for meaningful correlation
+    uid = user2idx[worker_id]
+
+    imgs, gt_scores = [], []
+    for _, row in user_rows.iterrows():
+        img_path = os.path.join(image_root_personal, row["image_name"])
+        try:
+            imgs.append(preprocess(Image.open(img_path).convert("RGB")))
+            gt_scores.append(row["global_score"])
+        except Exception:
+            pass
+    if not imgs:
+        continue
+
+    img_tensor = torch.stack(imgs).to(device)
+    with torch.no_grad():
+        feats = clip_eval.encode_image(img_tensor)
+        embs  = torch.from_numpy(normalized(feats.cpu().numpy())).float().to(device)
+        user_idx_tensor = torch.full((len(imgs),), uid, dtype=torch.long, device=device)
+        p_scores = personal_model_eval(embs, user_idx_tensor).squeeze().cpu().numpy()
+        g_scores = model_eval(embs).squeeze().cpu().numpy()
+
+    if p_scores.ndim == 0:
+        p_scores = p_scores.reshape(1)
+    if g_scores.ndim == 0:
+        g_scores = g_scores.reshape(1)
+
+    gt = np.array(gt_scores)
+    srcc_u, _ = spearmanr(p_scores, gt)
+    mae_u     = np.mean(np.abs(p_scores - gt))
+    per_user_srcc.append(srcc_u)
+    per_user_mae.append(mae_u)
+    all_personal_preds.extend(p_scores.tolist())
+    all_personal_targets.extend(gt.tolist())
+    all_global_preds_on_personal.extend(g_scores.tolist())
+
+all_personal_preds          = np.array(all_personal_preds)
+all_personal_targets        = np.array(all_personal_targets)
+all_global_preds_on_personal = np.array(all_global_preds_on_personal)
+
+print(f"Evaluated {len(test_workers)} users")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Aggregate metrics
+personal_metrics = print_regression_metrics(
+    all_personal_preds, all_personal_targets, label="Personalized MLP (all users pooled)"
+)
+
+print(f"\n  Per-user SRCC (avg):  {np.mean(per_user_srcc):.4f}  "
+      f"(std={np.std(per_user_srcc):.4f})")
+print(f"  Per-user MAE  (avg):  {np.mean(per_user_mae):.4f}  "
+      f"(std={np.std(per_user_mae):.4f})")
+
+# Personalization gain
+global_mae_on_personal = np.mean(np.abs(all_global_preds_on_personal - all_personal_targets))
+personal_mae_on_personal = personal_metrics["mae"]
+gain_mae = global_mae_on_personal - personal_mae_on_personal
+
+global_srcc_on_personal, _ = spearmanr(all_global_preds_on_personal, all_personal_targets)
+personal_srcc_on_personal, _ = spearmanr(all_personal_preds, all_personal_targets)
+gain_srcc = personal_srcc_on_personal - global_srcc_on_personal
+
+print(f"\n{'─'*55}")
+print(f"Personalization gain (personalized vs global, same images)")
+print(f"{'─'*55}")
+print(f"  Global MAE  on personal set:  {global_mae_on_personal:.4f}")
+print(f"  Personal MAE on personal set: {personal_mae_on_personal:.4f}")
+print(f"  MAE improvement:              {gain_mae:+.4f}  {'✓ better' if gain_mae > 0 else '✗ worse'}")
+print(f"  Global SRCC:                  {global_srcc_on_personal:.4f}")
+print(f"  Personal SRCC:                {personal_srcc_on_personal:.4f}")
+print(f"  SRCC improvement:             {gain_srcc:+.4f}  {'✓ better' if gain_srcc > 0 else '✗ worse'}")
+```
+
+
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
 
@@ -1166,6 +1404,9 @@ from torchvision import datasets
 from torch.utils.data import DataLoader
 import pandas as pd
 import clip
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from PIL import Image
 ```
 
 ```python
@@ -1382,6 +1623,63 @@ print(f"Inference Latency (single sample, 95th percentile): {np.percentile(laten
 print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
 print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
 print(f"Batch Throughput: {batch_fps:.2f} FPS")
+```
+
+
+#### Quality metrics — Global FP32 ONNX baseline
+
+These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on the held-out test split. Establish this baseline before quantizing in notebook 7.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Quality metrics: full test split — Global FP32 ONNX baseline
+global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+image_root_q = os.path.join(data_dir, "40K")
+print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
+print("(This may take several minutes on CPU.)")
+
+all_preds_g, all_targets_g = [], []
+with torch.no_grad():
+    for _i in range(0, len(test_g_q), 32):
+        _batch = test_g_q.iloc[_i:_i+32]
+        _imgs, _tgts = [], []
+        for _, _row in _batch.iterrows():
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(image_root_q, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["global_score"])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
+        _preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _embs})[0].flatten()
+        all_preds_g.extend(_preds.tolist())
+        all_targets_g.extend(_tgts)
+        if (_i // 32) % 20 == 0:
+            print(f"  {min(_i + 32, len(test_g_q))}/{len(test_g_q)} images ...")
+
+all_preds_g  = np.array(all_preds_g,  dtype=np.float32)
+all_targets_g = np.array(all_targets_g, dtype=np.float32)
+mae_g   = np.mean(np.abs(all_preds_g - all_targets_g))
+rmse_g  = np.sqrt(np.mean((all_preds_g - all_targets_g) ** 2))
+plcc_g, _ = pearsonr(all_preds_g, all_targets_g)
+srcc_g, _ = spearmanr(all_preds_g, all_targets_g)
+bin_acc_g = np.mean((all_preds_g >= 0.5) == (all_targets_g >= 0.5))
+auc_g   = roc_auc_score((all_targets_g >= 0.5).astype(int), all_preds_g)
+print(f"\n{'─'*55}")
+print(f"Quality metrics — Global FP32 ONNX (baseline)")
+print(f"{'─'*55}")
+print(f"  N:                {len(all_preds_g)}")
+print(f"  MAE:              {mae_g:.4f}")
+print(f"  RMSE:             {rmse_g:.4f}")
+print(f"  PLCC:             {plcc_g:.4f}")
+print(f"  SRCC:             {srcc_g:.4f}")
+print(f"  Binary accuracy:  {bin_acc_g:.4f}  (threshold=0.5)")
+print(f"  AUC-ROC:          {auc_g:.4f}")
+print("Compare with quantized / optimized variants in notebook 7.")
 ```
 
 <!-- summary for flickr_global
@@ -1652,6 +1950,64 @@ print(f"Batch Throughput: {p_batch_fps:.2f} FPS")
 ```
 
 
+#### Quality metrics — Personalized FP32 ONNX baseline
+
+Per-user SRCC and MAE across every annotator in the test split.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
+p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+image_root_p = os.path.join(data_dir, "40K")
+input_names_p = [i.name for i in personal_ort_session.get_inputs()]
+test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]
+print(f"Personalized test: {len(test_p_q)} rows, {len(test_workers_q)} known workers")
+print("(Running CLIP + ONNX per worker — may take several minutes on CPU.)")
+
+per_user_srcc_q, per_user_mae_q = [], []
+for worker_id in test_workers_q:
+    uid = user2idx[worker_id]
+    worker_df = test_p_q[test_p_q["worker_id"] == worker_id].reset_index(drop=True)
+    if len(worker_df) < 3:
+        continue
+    w_preds, w_targets = [], []
+    with torch.no_grad():
+        for _i in range(0, len(worker_df), 32):
+            _batch = worker_df.iloc[_i:_i+32]
+            _imgs, _tgts = [], []
+            for _, _row in _batch.iterrows():
+                try:
+                    _imgs.append(clip_preprocess(Image.open(os.path.join(image_root_p, _row["image_name"])).convert("RGB")))
+                    _tgts.append(_row["worker_score_norm"])
+                except Exception:
+                    pass
+            if not _imgs:
+                continue
+            _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+            _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
+            _uids = np.full(len(_imgs), uid, dtype=np.int64)
+            _preds = personal_ort_session.run(None, {input_names_p[0]: _embs, input_names_p[1]: _uids})[0].flatten()
+            w_preds.extend(_preds.tolist())
+            w_targets.extend(_tgts)
+    if len(w_preds) < 3:
+        continue
+    w_p = np.array(w_preds)
+    w_t = np.array(w_targets)
+    per_user_srcc_q.append(spearmanr(w_p, w_t)[0])
+    per_user_mae_q.append(np.mean(np.abs(w_p - w_t)))
+
+print(f"\n{'─'*55}")
+print(f"Quality metrics — Personalized FP32 ONNX (baseline)")
+print(f"{'─'*55}")
+print(f"  Users evaluated:    {len(per_user_srcc_q)}")
+print(f"  Mean per-user SRCC: {np.mean(per_user_srcc_q):.4f}")
+print(f"  Mean per-user MAE:  {np.mean(per_user_mae_q):.4f}")
+print("Compare with quantized variants in notebook 7.")
+```
+
+
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
@@ -1691,6 +2047,9 @@ from torchvision import datasets
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import clip
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from PIL import Image
 ```
 
 ```python
@@ -1723,6 +2082,71 @@ with torch.no_grad():
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     single_embedding = batch_embeddings[:1]
 print(f"Embeddings shape: {batch_embeddings.shape}")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute FULL test embeddings for quality metrics (one-time cost; reused across all variants).
+# The tiny MLP is then benchmarked 4 times on these embeddings — no CLIP re-run per variant.
+print("Pre-computing test embeddings for quality metrics...")
+print("(Runs the full CLIP encoder over the test set once; may take several minutes on CPU.)")
+
+_g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+_test_g = _g_manifest[_g_manifest["split"] == "inference"].reset_index(drop=True)
+_img_root = os.path.join(data_dir, "40K")
+
+_qm_g_embs_list, _qm_g_tgts = [], []
+with torch.no_grad():
+    for _i in range(0, len(_test_g), 32):
+        _batch = _test_g.iloc[_i:_i+32]
+        _imgs, _tgts = [], []
+        for _, _row in _batch.iterrows():
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["global_score"])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _qm_g_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _qm_g_tgts.extend(_tgts)
+        if (_i // 32) % 20 == 0:
+            print(f"  Global: {min(_i+32, len(_test_g))}/{len(_test_g)} ...")
+_qm_g_embs = np.concatenate(_qm_g_embs_list, axis=0)
+_qm_g_tgts = np.array(_qm_g_tgts, dtype=np.float32)
+
+_p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+_test_p = _p_manifest[_p_manifest["split"] == "inference"].reset_index(drop=True)
+_seen_w = sorted(_p_manifest.loc[_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+_user2idx_qm = {u: i for i, u in enumerate(_seen_w)}
+
+_qm_p_embs_list, _qm_p_tgts, _qm_p_uidxs = [], [], []
+with torch.no_grad():
+    for _i in range(0, len(_test_p), 32):
+        _batch = _test_p.iloc[_i:_i+32]
+        _imgs, _tgts, _uids = [], [], []
+        for _, _row in _batch.iterrows():
+            if _row["worker_id"] not in _user2idx_qm:
+                continue
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["worker_score_norm"])
+                _uids.append(_user2idx_qm[_row["worker_id"]])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _qm_p_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _qm_p_tgts.extend(_tgts)
+        _qm_p_uidxs.extend(_uids)
+        if (_i // 32) % 20 == 0:
+            print(f"  Personal: {min(_i+32, len(_test_p))}/{len(_test_p)} ...")
+_qm_p_embs = np.concatenate(_qm_p_embs_list, axis=0)
+_qm_p_tgts  = np.array(_qm_p_tgts,  dtype=np.float32)
+_qm_p_uidxs = np.array(_qm_p_uidxs, dtype=np.int64)
+print(f"Ready: {len(_qm_g_embs)} global, {len(_qm_p_embs)} personalized embeddings.")
 ```
 
 
@@ -1772,6 +2196,17 @@ def benchmark_session(ort_session):
 
     batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+    ## Quality metrics (on full test set using pre-computed embeddings)
+    qm_preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _qm_g_embs})[0].flatten()
+    qm_mae  = np.mean(np.abs(qm_preds - _qm_g_tgts))
+    qm_rmse = np.sqrt(np.mean((qm_preds - _qm_g_tgts) ** 2))
+    qm_plcc, _ = pearsonr(qm_preds, _qm_g_tgts)
+    qm_srcc, _ = spearmanr(qm_preds, _qm_g_tgts)
+    qm_acc  = np.mean((qm_preds >= 0.5) == (_qm_g_tgts >= 0.5))
+    qm_auc  = roc_auc_score((_qm_g_tgts >= 0.5).astype(int), qm_preds)
+    print(f"\nQuality metrics (N={len(qm_preds)} — Global MLP):")
+    print(f"  MAE: {qm_mae:.4f}  RMSE: {qm_rmse:.4f}  PLCC: {qm_plcc:.4f}  SRCC: {qm_srcc:.4f}  Acc: {qm_acc:.4f}  AUC: {qm_auc:.4f}")
 
 ```
 
@@ -1823,6 +2258,20 @@ def benchmark_personal_session(ort_session):
 
     batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+    ## Quality metrics (per-user SRCC and MAE on full test set)
+    _qm_in = [i.name for i in ort_session.get_inputs()]
+    qm_p_preds = ort_session.run(None, {_qm_in[0]: _qm_p_embs, _qm_in[1]: _qm_p_uidxs})[0].flatten()
+    _per_srcc, _per_mae = [], []
+    for uid in np.unique(_qm_p_uidxs):
+        mask = _qm_p_uidxs == uid
+        if mask.sum() < 3:
+            continue
+        _s, _ = spearmanr(qm_p_preds[mask], _qm_p_tgts[mask])
+        _per_srcc.append(_s)
+        _per_mae.append(np.mean(np.abs(qm_p_preds[mask] - _qm_p_tgts[mask])))
+    print(f"\nQuality metrics (N={len(qm_p_preds)}, {len(_per_srcc)} users — Personalized MLP):")
+    print(f"  Mean per-user SRCC: {np.mean(_per_srcc):.4f}  Mean per-user MAE: {np.mean(_per_mae):.4f}")
 
 print(f"Personalized model: {num_users} known users")
 ```
@@ -2496,6 +2945,9 @@ from torchvision import datasets
 from torch.utils.data import DataLoader
 import pandas as pd
 import clip
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from PIL import Image
 ```
 
 
@@ -3057,6 +3509,71 @@ ort.get_device()
 
 
 
+#### Pre-compute test embeddings for TRT precision check
+
+TensorRT on Ampere GPUs may silently apply FP16 precision, which can degrade prediction quality. We pre-compute all test embeddings once on GPU (fast: seconds), then verify quality metrics after each TRT benchmark call.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute all test embeddings on GPU (one-time; used for TRT quality checks below)
+print("Pre-computing test embeddings on GPU for TRT quality verification...")
+_trt_g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+_trt_test_g = _trt_g_manifest[_trt_g_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_img_root = os.path.join(data_dir, "40K")
+
+_trt_g_embs_list, _trt_g_tgts = [], []
+with torch.no_grad():
+    for _i in range(0, len(_trt_test_g), 64):
+        _batch = _trt_test_g.iloc[_i:_i+64]
+        _imgs, _tgts = [], []
+        for _, _row in _batch.iterrows():
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_trt_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["global_score"])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _trt_g_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _trt_g_tgts.extend(_tgts)
+_trt_g_embs = np.concatenate(_trt_g_embs_list, axis=0)
+_trt_g_tgts = np.array(_trt_g_tgts, dtype=np.float32)
+
+_trt_p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+_trt_test_p = _trt_p_manifest[_trt_p_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_seen_w = sorted(_trt_p_manifest.loc[_trt_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+_trt_user2idx = {u: i for i, u in enumerate(_trt_seen_w)}
+
+_trt_p_embs_list, _trt_p_tgts, _trt_p_uidxs = [], [], []
+with torch.no_grad():
+    for _i in range(0, len(_trt_test_p), 64):
+        _batch = _trt_test_p.iloc[_i:_i+64]
+        _imgs, _tgts, _uids = [], [], []
+        for _, _row in _batch.iterrows():
+            if _row["worker_id"] not in _trt_user2idx:
+                continue
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_trt_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["worker_score_norm"])
+                _uids.append(_trt_user2idx[_row["worker_id"]])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _trt_p_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _trt_p_tgts.extend(_tgts)
+        _trt_p_uidxs.extend(_uids)
+_trt_p_embs = np.concatenate(_trt_p_embs_list, axis=0)
+_trt_p_tgts  = np.array(_trt_p_tgts,  dtype=np.float32)
+_trt_p_uidxs = np.array(_trt_p_uidxs, dtype=np.int64)
+print(f"Ready: {len(_trt_g_embs)} global + {len(_trt_p_embs)} personalized test embeddings.")
+```
+
+
+
 #### TensorRT execution provider
 
 
@@ -3078,6 +3595,30 @@ ort.get_device()
 
 ```python
 # runs in jupyter container on node-serve-model
+# Quality metrics: Global MLP with TensorRT EP
+# TRT on Ampere may use FP16; if these values degrade vs CUDA EP, precision loss is the cause.
+_trt_g_preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _trt_g_embs})[0].flatten()
+_trt_mae  = np.mean(np.abs(_trt_g_preds - _trt_g_tgts))
+_trt_rmse = np.sqrt(np.mean((_trt_g_preds - _trt_g_tgts) ** 2))
+_trt_plcc, _ = pearsonr(_trt_g_preds, _trt_g_tgts)
+_trt_srcc, _ = spearmanr(_trt_g_preds, _trt_g_tgts)
+_trt_acc  = np.mean((_trt_g_preds >= 0.5) == (_trt_g_tgts >= 0.5))
+_trt_auc  = roc_auc_score((_trt_g_tgts >= 0.5).astype(int), _trt_g_preds)
+print(f"\n{'─'*60}")
+print(f"Quality metrics — Global MLP | TensorrtExecutionProvider")
+print(f"{'─'*60}")
+print(f"  N:                {len(_trt_g_preds)}")
+print(f"  MAE:              {_trt_mae:.4f}")
+print(f"  RMSE:             {_trt_rmse:.4f}")
+print(f"  PLCC:             {_trt_plcc:.4f}")
+print(f"  SRCC:             {_trt_srcc:.4f}")
+print(f"  Binary accuracy:  {_trt_acc:.4f}  (threshold=0.5)")
+print(f"  AUC-ROC:          {_trt_auc:.4f}")
+print("Compare with FP32 CUDA EP metrics: any drop indicates FP16 precision trade-off.")
+```
+
+```python
+# runs in jupyter container on node-serve-model
 # Personalized MLP - TensorRT execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
 monitor.start()
@@ -3086,6 +3627,28 @@ benchmark_personal_session(ort_session)
 monitor.stop()
 monitor.summary("Personalized MLP — TensorrtExecutionProvider")
 ort.get_device()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Quality metrics: Personalized MLP with TensorRT EP — per-user SRCC and MAE
+_trt_p_in = [i.name for i in ort_session.get_inputs()]
+_trt_p_preds = ort_session.run(None, {_trt_p_in[0]: _trt_p_embs, _trt_p_in[1]: _trt_p_uidxs})[0].flatten()
+_trt_per_srcc, _trt_per_mae = [], []
+for uid in np.unique(_trt_p_uidxs):
+    mask = _trt_p_uidxs == uid
+    if mask.sum() < 3:
+        continue
+    _s, _ = spearmanr(_trt_p_preds[mask], _trt_p_tgts[mask])
+    _trt_per_srcc.append(_s)
+    _trt_per_mae.append(np.mean(np.abs(_trt_p_preds[mask] - _trt_p_tgts[mask])))
+print(f"\n{'─'*60}")
+print(f"Quality metrics — Personalized MLP | TensorrtExecutionProvider")
+print(f"{'─'*60}")
+print(f"  Users evaluated:    {len(_trt_per_srcc)}")
+print(f"  Mean per-user SRCC: {np.mean(_trt_per_srcc):.4f}")
+print(f"  Mean per-user MAE:  {np.mean(_trt_per_mae):.4f}")
+print("Compare with FP32 CUDA EP metrics: any drop indicates FP16 precision trade-off.")
 ```
 
 <!-- placeholder: update with real benchmark numbers -->

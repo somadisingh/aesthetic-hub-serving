@@ -940,6 +940,262 @@ print("depends primarily on the ViT encoder performance.")
 
 ::: {.cell .markdown}
 
+---
+
+## Part 5: Quality Metrics
+
+Performance benchmarks tell you *how fast* the models run. Quality metrics tell you *how well* they predict — essential for right-sizing decisions (no point in ultra-low latency on a model that lacks accuracy).
+
+We run both models over their respective held-out inference sets and compute:
+
+**Global MLP**: MAE, RMSE, PLCC, SRCC, binary accuracy (threshold = 0.5), AUC-ROC  
+**Personalized MLP**: same per-user metrics averaged across users, plus personalization gain vs global
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from torchvision import transforms
+from PIL import Image
+import glob
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def collect_global_predictions(manifest_df, image_root, clip_model, mlp_model, device,
+                               clip_preprocess, batch_size=64):
+    """Run the full ViT → MLP pipeline over all images in manifest_df.
+    Returns (preds, targets) as numpy arrays."""
+    preprocess = clip_preprocess
+    preds, targets = [], []
+    rows = manifest_df.reset_index(drop=True)
+
+    for start in range(0, len(rows), batch_size):
+        batch_rows = rows.iloc[start:start + batch_size]
+        imgs = []
+        valid_mask = []
+        for _, row in batch_rows.iterrows():
+            img_path = os.path.join(image_root, row["image_name"])
+            try:
+                img = preprocess(Image.open(img_path).convert("RGB"))
+                imgs.append(img)
+                valid_mask.append(True)
+            except Exception:
+                valid_mask.append(False)
+        if not imgs:
+            continue
+        img_tensor = torch.stack(imgs).to(device)
+        with torch.no_grad():
+            feats = clip_model.encode_image(img_tensor)
+            embs = torch.from_numpy(normalized(feats.cpu().numpy())).float().to(device)
+            scores = mlp_model(embs).squeeze().cpu().numpy()
+        if scores.ndim == 0:
+            scores = scores.reshape(1)
+        gt = batch_rows.loc[[v for v, m in zip(batch_rows.index, valid_mask) if m], "global_score"].values
+        preds.extend(scores.tolist())
+        targets.extend(gt.tolist())
+
+    return np.array(preds), np.array(targets)
+
+
+def print_regression_metrics(preds, targets, label=""):
+    mae  = np.mean(np.abs(preds - targets))
+    rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    plcc, _ = pearsonr(preds, targets)
+    srcc, _ = spearmanr(preds, targets)
+    threshold = 0.5
+    bin_acc = np.mean((preds >= threshold) == (targets >= threshold))
+    try:
+        auc = roc_auc_score((targets >= threshold).astype(int), preds)
+    except ValueError:
+        auc = float("nan")  # only one class present
+
+    print(f"\n{'─'*55}")
+    print(f"Quality metrics — {label}")
+    print(f"{'─'*55}")
+    print(f"  MAE:              {mae:.4f}")
+    print(f"  RMSE:             {rmse:.4f}")
+    print(f"  PLCC:             {plcc:.4f}")
+    print(f"  SRCC:             {srcc:.4f}")
+    print(f"  Binary accuracy:  {bin_acc:.4f}  (threshold={threshold})")
+    print(f"  AUC-ROC:          {auc:.4f}")
+    return dict(mae=mae, rmse=rmse, plcc=plcc, srcc=srcc, bin_acc=bin_acc, auc=auc)
+```
+:::
+
+::: {.cell .markdown}
+
+### Global MLP — quality metrics
+
+Load the test split from `flickr_global_manifest.csv` and run inference over all held-out images.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
+global_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+
+# Use only the inference (test) split
+global_test = global_manifest[global_manifest["split"] == "inference"].copy()
+image_root_global = os.path.join(data_dir, "40K")
+
+print(f"Global test set: {len(global_test)} images")
+global_test.head()
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Reload clean CPU models (without compile artifacts)
+model_eval = torch.load("models/flickr_global_best_inference_only.pth",
+                        map_location=device, weights_only=False)
+model_eval.eval()
+clip_eval, clip_pre_eval = clip.load("ViT-L/14", device=device)
+
+global_preds, global_targets = collect_global_predictions(
+    global_test, image_root_global, clip_eval, model_eval, device, clip_pre_eval
+)
+print(f"Collected {len(global_preds)} predictions")
+global_metrics = print_regression_metrics(global_preds, global_targets, label="Global MLP")
+```
+:::
+
+::: {.cell .markdown}
+
+### Personalized MLP — quality metrics
+
+For the personalized model we compute metrics per user (using their held-out (image, score) pairs), then average across users.  
+We also compute **personalization gain**: how much the personalized model improves on the global model for the same samples.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+
+# Use only the inference split
+personal_test = personal_manifest[personal_manifest["split"] == "inference"].copy()
+
+# Use worker_score_norm as ground truth (already in [0,1])
+personal_test = personal_test.rename(columns={"worker_score_norm": "global_score"})
+
+# Build user index mapping (must match training)
+seen_workers = sorted(
+    personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique()
+)
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+
+image_root_personal = os.path.join(data_dir, "40K")
+personal_model_eval = torch.load("models/flickr_personalized_best_inference_only.pth",
+                                  map_location=device, weights_only=False)
+personal_model_eval.eval()
+
+print(f"Personalized test set: {len(personal_test)} rows, "
+      f"{personal_test['worker_id'].nunique()} users")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+per_user_srcc = []
+per_user_mae  = []
+all_personal_preds   = []
+all_personal_targets = []
+all_global_preds_on_personal = []
+
+preprocess = clip_pre_eval
+test_workers = [w for w in personal_test["worker_id"].unique() if w in user2idx]
+
+for worker_id in test_workers:
+    user_rows = personal_test[personal_test["worker_id"] == worker_id].reset_index(drop=True)
+    if len(user_rows) < 3:
+        continue  # skip users with too few samples for meaningful correlation
+    uid = user2idx[worker_id]
+
+    imgs, gt_scores = [], []
+    for _, row in user_rows.iterrows():
+        img_path = os.path.join(image_root_personal, row["image_name"])
+        try:
+            imgs.append(preprocess(Image.open(img_path).convert("RGB")))
+            gt_scores.append(row["global_score"])
+        except Exception:
+            pass
+    if not imgs:
+        continue
+
+    img_tensor = torch.stack(imgs).to(device)
+    with torch.no_grad():
+        feats = clip_eval.encode_image(img_tensor)
+        embs  = torch.from_numpy(normalized(feats.cpu().numpy())).float().to(device)
+        user_idx_tensor = torch.full((len(imgs),), uid, dtype=torch.long, device=device)
+        p_scores = personal_model_eval(embs, user_idx_tensor).squeeze().cpu().numpy()
+        g_scores = model_eval(embs).squeeze().cpu().numpy()
+
+    if p_scores.ndim == 0:
+        p_scores = p_scores.reshape(1)
+    if g_scores.ndim == 0:
+        g_scores = g_scores.reshape(1)
+
+    gt = np.array(gt_scores)
+    srcc_u, _ = spearmanr(p_scores, gt)
+    mae_u     = np.mean(np.abs(p_scores - gt))
+    per_user_srcc.append(srcc_u)
+    per_user_mae.append(mae_u)
+    all_personal_preds.extend(p_scores.tolist())
+    all_personal_targets.extend(gt.tolist())
+    all_global_preds_on_personal.extend(g_scores.tolist())
+
+all_personal_preds          = np.array(all_personal_preds)
+all_personal_targets        = np.array(all_personal_targets)
+all_global_preds_on_personal = np.array(all_global_preds_on_personal)
+
+print(f"Evaluated {len(test_workers)} users")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Aggregate metrics
+personal_metrics = print_regression_metrics(
+    all_personal_preds, all_personal_targets, label="Personalized MLP (all users pooled)"
+)
+
+print(f"\n  Per-user SRCC (avg):  {np.mean(per_user_srcc):.4f}  "
+      f"(std={np.std(per_user_srcc):.4f})")
+print(f"  Per-user MAE  (avg):  {np.mean(per_user_mae):.4f}  "
+      f"(std={np.std(per_user_mae):.4f})")
+
+# Personalization gain
+global_mae_on_personal = np.mean(np.abs(all_global_preds_on_personal - all_personal_targets))
+personal_mae_on_personal = personal_metrics["mae"]
+gain_mae = global_mae_on_personal - personal_mae_on_personal
+
+global_srcc_on_personal, _ = spearmanr(all_global_preds_on_personal, all_personal_targets)
+personal_srcc_on_personal, _ = spearmanr(all_personal_preds, all_personal_targets)
+gain_srcc = personal_srcc_on_personal - global_srcc_on_personal
+
+print(f"\n{'─'*55}")
+print(f"Personalization gain (personalized vs global, same images)")
+print(f"{'─'*55}")
+print(f"  Global MAE  on personal set:  {global_mae_on_personal:.4f}")
+print(f"  Personal MAE on personal set: {personal_mae_on_personal:.4f}")
+print(f"  MAE improvement:              {gain_mae:+.4f}  {'✓ better' if gain_mae > 0 else '✗ worse'}")
+print(f"  Global SRCC:                  {global_srcc_on_personal:.4f}")
+print(f"  Personal SRCC:                {personal_srcc_on_personal:.4f}")
+print(f"  SRCC improvement:             {gain_srcc:+.4f}  {'✓ better' if gain_srcc > 0 else '✗ worse'}")
+```
+:::
+
+::: {.cell .markdown}
+
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
 :::

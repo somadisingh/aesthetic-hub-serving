@@ -37,6 +37,9 @@ from torchvision import datasets
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import clip
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from PIL import Image
 ```
 :::
 
@@ -75,6 +78,73 @@ with torch.no_grad():
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     single_embedding = batch_embeddings[:1]
 print(f"Embeddings shape: {batch_embeddings.shape}")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute FULL test embeddings for quality metrics (one-time cost; reused across all variants).
+# The tiny MLP is then benchmarked 4 times on these embeddings — no CLIP re-run per variant.
+print("Pre-computing test embeddings for quality metrics...")
+print("(Runs the full CLIP encoder over the test set once; may take several minutes on CPU.)")
+
+_g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+_test_g = _g_manifest[_g_manifest["split"] == "inference"].reset_index(drop=True)
+_img_root = os.path.join(data_dir, "40K")
+
+_qm_g_embs_list, _qm_g_tgts = [], []
+with torch.no_grad():
+    for _i in range(0, len(_test_g), 32):
+        _batch = _test_g.iloc[_i:_i+32]
+        _imgs, _tgts = [], []
+        for _, _row in _batch.iterrows():
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["global_score"])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _qm_g_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _qm_g_tgts.extend(_tgts)
+        if (_i // 32) % 20 == 0:
+            print(f"  Global: {min(_i+32, len(_test_g))}/{len(_test_g)} ...")
+_qm_g_embs = np.concatenate(_qm_g_embs_list, axis=0)
+_qm_g_tgts = np.array(_qm_g_tgts, dtype=np.float32)
+
+_p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+_test_p = _p_manifest[_p_manifest["split"] == "inference"].reset_index(drop=True)
+_seen_w = sorted(_p_manifest.loc[_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+_user2idx_qm = {u: i for i, u in enumerate(_seen_w)}
+
+_qm_p_embs_list, _qm_p_tgts, _qm_p_uidxs = [], [], []
+with torch.no_grad():
+    for _i in range(0, len(_test_p), 32):
+        _batch = _test_p.iloc[_i:_i+32]
+        _imgs, _tgts, _uids = [], [], []
+        for _, _row in _batch.iterrows():
+            if _row["worker_id"] not in _user2idx_qm:
+                continue
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(_img_root, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["worker_score_norm"])
+                _uids.append(_user2idx_qm[_row["worker_id"]])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _qm_p_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
+        _qm_p_tgts.extend(_tgts)
+        _qm_p_uidxs.extend(_uids)
+        if (_i // 32) % 20 == 0:
+            print(f"  Personal: {min(_i+32, len(_test_p))}/{len(_test_p)} ...")
+_qm_p_embs = np.concatenate(_qm_p_embs_list, axis=0)
+_qm_p_tgts  = np.array(_qm_p_tgts,  dtype=np.float32)
+_qm_p_uidxs = np.array(_qm_p_uidxs, dtype=np.int64)
+print(f"Ready: {len(_qm_g_embs)} global, {len(_qm_p_embs)} personalized embeddings.")
 ```
 :::
 
@@ -126,6 +196,17 @@ def benchmark_session(ort_session):
 
     batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+    ## Quality metrics (on full test set using pre-computed embeddings)
+    qm_preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _qm_g_embs})[0].flatten()
+    qm_mae  = np.mean(np.abs(qm_preds - _qm_g_tgts))
+    qm_rmse = np.sqrt(np.mean((qm_preds - _qm_g_tgts) ** 2))
+    qm_plcc, _ = pearsonr(qm_preds, _qm_g_tgts)
+    qm_srcc, _ = spearmanr(qm_preds, _qm_g_tgts)
+    qm_acc  = np.mean((qm_preds >= 0.5) == (_qm_g_tgts >= 0.5))
+    qm_auc  = roc_auc_score((_qm_g_tgts >= 0.5).astype(int), qm_preds)
+    print(f"\nQuality metrics (N={len(qm_preds)} — Global MLP):")
+    print(f"  MAE: {qm_mae:.4f}  RMSE: {qm_rmse:.4f}  PLCC: {qm_plcc:.4f}  SRCC: {qm_srcc:.4f}  Acc: {qm_acc:.4f}  AUC: {qm_auc:.4f}")
 
 ```
 :::
@@ -179,6 +260,20 @@ def benchmark_personal_session(ort_session):
 
     batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+    ## Quality metrics (per-user SRCC and MAE on full test set)
+    _qm_in = [i.name for i in ort_session.get_inputs()]
+    qm_p_preds = ort_session.run(None, {_qm_in[0]: _qm_p_embs, _qm_in[1]: _qm_p_uidxs})[0].flatten()
+    _per_srcc, _per_mae = [], []
+    for uid in np.unique(_qm_p_uidxs):
+        mask = _qm_p_uidxs == uid
+        if mask.sum() < 3:
+            continue
+        _s, _ = spearmanr(qm_p_preds[mask], _qm_p_tgts[mask])
+        _per_srcc.append(_s)
+        _per_mae.append(np.mean(np.abs(qm_p_preds[mask] - _qm_p_tgts[mask])))
+    print(f"\nQuality metrics (N={len(qm_p_preds)}, {len(_per_srcc)} users — Personalized MLP):")
+    print(f"  Mean per-user SRCC: {np.mean(_per_srcc):.4f}  Mean per-user MAE: {np.mean(_per_mae):.4f}")
 
 print(f"Personalized model: {num_users} known users")
 ```
