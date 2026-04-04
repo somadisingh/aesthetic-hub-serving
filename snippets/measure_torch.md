@@ -305,6 +305,8 @@ for bs in batch_sizes:
     with torch.no_grad():
         clip_model.encode_image(batch)
 
+    # Reset PyTorch peak memory counter for accurate per-batch tracking
+    torch.cuda.reset_peak_memory_stats()
     monitor.start()
     times = []
     with torch.no_grad():
@@ -317,18 +319,19 @@ for bs in batch_sizes:
                 torch.cuda.synchronize()
             times.append(time.time() - start_time)
     monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 
     fps = (bs * num_batches) / np.sum(times)
     vit_batch_results_eager[bs] = {"times": times, "fps": fps,
                                    "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
-                                   "gpu_mem": max(monitor.gpu_mem_used) if monitor.gpu_mem_used else 0}
+                                   "gpu_mem": peak_mem_mb}
 
     print(f"\nbatch_size={bs}:")
     print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
     print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
     print(f"  Throughput: {fps:.2f} FPS")
     print(f"  GPU util: {vit_batch_results_eager[bs]['gpu_util']:.1f}%  "
-          f"GPU mem peak: {vit_batch_results_eager[bs]['gpu_mem']:.0f} MB")
+          f"GPU mem peak: {peak_mem_mb:.0f} MB")
     monitor.summary(f"ViT-L/14 eager batch_size={bs} (GPU)")
 ```
 :::
@@ -394,6 +397,8 @@ for bs in batch_sizes:
     with torch.no_grad():
         clip_model.encode_image(batch)
 
+    # Reset PyTorch peak memory counter for accurate per-batch tracking
+    torch.cuda.reset_peak_memory_stats()
     monitor.start()
     times = []
     with torch.no_grad():
@@ -406,18 +411,19 @@ for bs in batch_sizes:
                 torch.cuda.synchronize()
             times.append(time.time() - start_time)
     monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 
     fps = (bs * num_batches) / np.sum(times)
     vit_batch_results_compiled[bs] = {"times": times, "fps": fps,
                                       "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
-                                      "gpu_mem": max(monitor.gpu_mem_used) if monitor.gpu_mem_used else 0}
+                                      "gpu_mem": peak_mem_mb}
 
     print(f"\nbatch_size={bs}:")
     print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
     print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
     print(f"  Throughput: {fps:.2f} FPS")
     print(f"  GPU util: {vit_batch_results_compiled[bs]['gpu_util']:.1f}%  "
-          f"GPU mem peak: {vit_batch_results_compiled[bs]['gpu_mem']:.0f} MB")
+          f"GPU mem peak: {peak_mem_mb:.0f} MB")
     monitor.summary(f"ViT-L/14 compiled batch_size={bs} (GPU)")
 ```
 :::
