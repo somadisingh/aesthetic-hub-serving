@@ -358,7 +358,7 @@ These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on
 # runs in jupyter container on node-serve-model
 # Quality metrics: full test split — Global FP32 ONNX baseline
 global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_g_q = global_manifest_q[global_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_q = os.path.join(data_dir, "40K")
 print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
 print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
@@ -502,7 +502,8 @@ The personalized model takes two inputs: a 768-dim CLIP embedding and a user ind
 personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
 _p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
 _num_users = _p_state["user_embedding.weight"].shape[0]
-personal_model = PersonalizedMLP(num_users=_num_users)
+_user_dim = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
 personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
@@ -724,7 +725,7 @@ Per-user SRCC and MAE across every annotator in the test split.
 # runs in jupyter container on node-serve-model
 # Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
 p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_p_q = p_manifest_q[p_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_p = os.path.join(data_dir, "40K")
 input_names_p = [i.name for i in personal_ort_session.get_inputs()]
 test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]

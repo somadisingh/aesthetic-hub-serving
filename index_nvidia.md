@@ -2007,7 +2007,7 @@ These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on
 # runs in jupyter container on node-serve-model
 # Quality metrics: full test split — Global FP32 ONNX baseline
 global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_g_q = global_manifest_q[global_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_q = os.path.join(data_dir, "40K")
 print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
 print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
@@ -2147,7 +2147,8 @@ The personalized model takes two inputs: a 768-dim CLIP embedding and a user ind
 personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
 _p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
 _num_users = _p_state["user_embedding.weight"].shape[0]
-personal_model = PersonalizedMLP(num_users=_num_users)
+_user_dim = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
 personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
@@ -2335,7 +2336,7 @@ Per-user SRCC and MAE across every annotator in the test split.
 # runs in jupyter container on node-serve-model
 # Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
 p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_p_q = p_manifest_q[p_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_p = os.path.join(data_dir, "40K")
 input_names_p = [i.name for i in personal_ort_session.get_inputs()]
 test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]
@@ -2469,7 +2470,7 @@ print("Pre-computing test embeddings for quality metrics...")
 print("(GPU CLIP encoding over the test set — should complete in 1-3 minutes.)")
 
 _g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-_test_g = _g_manifest[_g_manifest["split"] == "inference"].reset_index(drop=True)
+_test_g = _g_manifest[_g_manifest["split"] == "test"].reset_index(drop=True)
 _img_root = os.path.join(data_dir, "40K")
 
 _qm_g_embs_list, _qm_g_tgts = [], []
@@ -2494,7 +2495,7 @@ _qm_g_embs = np.concatenate(_qm_g_embs_list, axis=0)
 _qm_g_tgts = np.array(_qm_g_tgts, dtype=np.float32)
 
 _p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-_test_p = _p_manifest[_p_manifest["split"] == "inference"].reset_index(drop=True)
+_test_p = _p_manifest[_p_manifest["split"] == "test"].reset_index(drop=True)
 _seen_w = sorted(_p_manifest.loc[_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
 _user2idx_qm = {u: i for i, u in enumerate(_seen_w)}
 
@@ -2813,7 +2814,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_dynamic.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
 ```
 
 
@@ -2888,7 +2894,12 @@ Apply dynamic quantization to the personalized model.
 personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
 config_ptq = neural_compressor.PostTrainingQuantConfig(approach="dynamic")
 p_q_model = quantization.fit(model=personal_fp32, conf=config_ptq)
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_dynamic.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
 ```
 
 ```python
@@ -2971,7 +2982,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_aggressive.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
 ```
 
 
@@ -3073,7 +3089,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_conservative.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_conservative.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_conservative.onnx")
 ```
 
 
@@ -3165,12 +3186,23 @@ Apply the same static quantization approaches to the personalized model. We need
 
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare calibration dataloader for personalized model (two inputs)
+# Prepare calibration dataloader for personalized model (two inputs).
+# INC DataLoader expects (data, label) tuples. For multi-input models,
+# 'data' must itself be a list/tuple so INC passes each element as a
+# separate input tensor. We use a lightweight wrapper to yield
+# ([embedding, user_idx], dummy_label).
 p_cal_user_idx = np.zeros(len(cal_embeddings), dtype=np.int64)
-p_cal_dataset = TensorDataset(
-    torch.from_numpy(cal_embeddings), 
-    torch.from_numpy(p_cal_user_idx)
-)
+
+class _MultiInputCalDataset:
+    def __init__(self, embeddings, user_idx):
+        self._emb = embeddings
+        self._uid = user_idx
+    def __len__(self):
+        return len(self._emb)
+    def __getitem__(self, idx):
+        return [self._emb[idx], self._uid[idx]], 0
+
+p_cal_dataset = _MultiInputCalDataset(cal_embeddings, p_cal_user_idx)
 p_cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=p_cal_dataset)
 ```
 
@@ -3192,7 +3224,12 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
 p_q_model = quantization.fit(
     model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
 )
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_aggressive.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
 ```
 
 ```python
@@ -3226,7 +3263,12 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
 p_q_model = quantization.fit(
     model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
 )
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_conservative.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
 ```
 
 ```python
