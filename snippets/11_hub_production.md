@@ -57,7 +57,7 @@ Bring up the production stack (Triton + GPU Jupyter + perf_analyzer SDK):
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-production-nb11.yaml up -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-production.yaml up -d
 ```
 
 Wait for Triton to load both models (~30 seconds), then verify:
@@ -1018,7 +1018,7 @@ Then, bring down the production stack:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-production-nb11.yaml down
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-production.yaml down
 ```
 
 :::

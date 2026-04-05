@@ -1,5 +1,5 @@
 name: "flickr_personalized"
-platform: "onnxruntime_onnx"
+backend: "onnxruntime"
 max_batch_size: 128
 input [
   {
@@ -11,6 +11,7 @@ input [
     name: "user_idx"
     data_type: TYPE_INT64
     dims: [1]
+    reshape { shape: [] }
   }
 ]
 output [
